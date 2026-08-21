@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>発信中…</title>
+<style>
+  body{font-family:-apple-system,"Hiragino Sans",sans-serif;background:#f7f8fa;margin:0;
+       display:flex;align-items:center;justify-content:center;min-height:100vh}
+  .card{text-align:center;padding:32px}
+  .name{font-size:20px;font-weight:700;color:#1a1a2e}
+  .name span{font-size:13px;font-weight:400;color:#666}
+  .num{font-size:28px;font-weight:700;margin:8px 0 4px;color:#1a1a2e;letter-spacing:1px}
+  .msg{color:#888;font-size:13px;margin-top:14px;line-height:1.8}
+  a.btn{display:inline-block;margin-top:16px;padding:12px 32px;border-radius:10px;
+        text-decoration:none;font-size:16px;background:#0b5cff;color:#fff}
+  .err{color:#c0392b;font-size:15px}
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="name" id="name"></div>
+  <div class="num" id="num"></div>
+  <div id="body"></div>
+</div>
+<script>
+// 📞リンク(応募者管理表)から ?tel=090...&name=氏名 で開かれる。
+// zoomphonecall:// でZoomの発信画面を起動し、Zoomに切り替わったらタブを自動で閉じる。
+// GASのWebアプリはサンドボックス配信で自タブを閉じられないため、この素の静的ページを挟む。
+(function () {
+  var p = new URLSearchParams(location.search);
+  var raw = (p.get('tel') || '').trim();
+  var name = (p.get('name') || '').trim();
+
+  // +81 のE.164形式に正規化(シート側は 090-xxxx-xxxx のまま渡してくる)
+  function normalize(s) {
+    if (!s) return '';
+    var plus = s.charAt(0) === '+';
+    var digits = s.replace(/[^0-9]/g, '');
+    if (digits.length < 8 || digits.length > 15) return '';
+    if (plus) return '+' + digits;
+    if (digits.charAt(0) === '0') return '+81' + digits.slice(1);
+    return '+' + digits;
+  }
+
+  var tel = normalize(raw);
+  var body = document.getElementById('body');
+  if (!tel) {
+    body.innerHTML = '<div class="err">電話番号が正しくありません</div>' +
+      '<div class="msg">シートの📞から開き直してください</div>';
+    return;
+  }
+
+  if (name) {
+    document.getElementById('name').innerHTML = '';
+    document.getElementById('name').append(name + ' ');
+    var sp = document.createElement('span');
+    sp.textContent = 'さん';
+    document.getElementById('name').append(sp);
+  }
+  document.getElementById('num').textContent = tel;
+
+  var zoomUrl = 'zoomphonecall://' + tel; // telは正規化済みで [+0-9] のみ
+  body.innerHTML =
+    '<div class="msg">Zoom Phoneを起動しています…<br>Zoomが開いたらこのタブは自動で閉じます。<br>' +
+    '初回は「zoom.usを開きますか?」を「常に許可」で許可してください。</div>' +
+    '<div><a class="btn" href="' + zoomUrl + '">開かない場合はここを押す</a></div>';
+
+  location.href = zoomUrl;
+
+  // Zoomアプリに切り替わる(=このタブが非表示になる)のを検知して閉じる。
+  // 起動確認プロンプト表示中はタブが見えたままなので誤って閉じない
+  document.addEventListener('visibilitychange', function () {
+    if (document.hidden) window.close();
+  });
+})();
+</script>
+</body>
+</html>
