@@ -4,7 +4,10 @@ import { unstable_cache } from "next/cache";
 import { isDemo } from "./auth";
 import { demoTasks } from "./demo";
 import { readTasks, SheetError, sheetConfigured } from "./sheets";
-import { getSettings, listTriage } from "./store";
+import type { DoneEntry, Focus } from "./focus";
+import type { AiRequest } from "./ops";
+import { getFocus, getSettings, listConsults, listDone, listParking, listRequests, listTriage, type Parking } from "./store";
+import type { Consult } from "./team";
 import type { Settings, Task, Triage } from "./tasks";
 
 export const SHEET_TAG = "sheet";
@@ -52,3 +55,33 @@ export async function loadBoard(): Promise<Board> {
 
 /** Per-request memo so the layout and the page share one load. */
 export const getBoard = cache(loadBoard);
+
+/* ---------- app-only state (Postgres / memory) ---------- */
+
+export type AppState = {
+  focus: Focus | null;
+  parking: Parking[];
+  consults: Consult[];
+  /** Completions logged by the app in the last 8 days (covers this week and the team page's 7 days). */
+  doneLog: DoneEntry[];
+  requests: AiRequest[];
+  error: string | null;
+};
+
+export async function loadAppState(now = Date.now()): Promise<AppState> {
+  try {
+    const [focus, parking, consults, doneLog, requests] = await Promise.all([
+      getFocus(),
+      listParking(),
+      listConsults(),
+      listDone(now - 8 * 86400000),
+      listRequests(20),
+    ]);
+    return { focus, parking, consults, doneLog, requests, error: null };
+  } catch (e) {
+    console.error("[loadAppState]", e);
+    return { focus: null, parking: [], consults: [], doneLog: [], requests: [], error: "アプリのデータベースを読めませんでした。" };
+  }
+}
+
+export const getAppState = cache(() => loadAppState());

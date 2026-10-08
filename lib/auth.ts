@@ -46,3 +46,29 @@ export function safeEqual(a: string, b: string) {
   for (let i = 0; i < Math.max(ea.length, eb.length); i++) diff |= (ea[i] ?? 0) ^ (eb[i] ?? 0);
   return diff === 0;
 }
+
+/* ---------- machine & team access (no login) ---------- */
+
+const MIN_TOKEN = 16;
+
+/**
+ * True when an `Authorization: Bearer <token>` header carries WORKER_TOKEN.
+ * A missing or short WORKER_TOKEN disables the worker API entirely.
+ */
+export function workerAuthorized(header: string | null | undefined, token = process.env.WORKER_TOKEN) {
+  if (!token || token.length < MIN_TOKEN || !header) return false;
+  const m = header.match(/^Bearer\s+(\S+)\s*$/i);
+  return Boolean(m && safeEqual(m[1], token));
+}
+
+/** The secret path segment of the team page. In DEMO without TEAM_VIEW_TOKEN it is "demo-team". */
+export function teamViewToken(env: Record<string, string | undefined> = process.env) {
+  const t = env.TEAM_VIEW_TOKEN;
+  if (t && t.length >= MIN_TOKEN) return t;
+  return env.DEMO === "1" ? "demo-team" : null;
+}
+
+export function teamTokenOk(candidate: string | undefined) {
+  const t = teamViewToken();
+  return Boolean(t && candidate && safeEqual(candidate, t));
+}

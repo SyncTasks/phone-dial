@@ -5,11 +5,14 @@ import { revalidatePath, revalidateTag } from "next/cache";
 import { cookies } from "next/headers";
 import { redirect } from "next/navigation";
 import { authConfigured, createSession, isDemo, safeEqual, SESSION_COOKIE, SESSION_DAYS, verifySession } from "@/lib/auth";
-import { demoState, SHEET_TAG } from "@/lib/data";
-import { appendTask, SheetError, updateTaskRow, type TaskPatch } from "@/lib/sheets";
+import { loadBoard, SHEET_TAG } from "@/lib/data";
+import { doneThisWeek, type Focus } from "@/lib/focus";
+import { MAX_REQUEST_TEXT, validateOp, type AiRequest, type RequestKind } from "@/lib/ops";
+import { SheetError, type TaskPatch } from "@/lib/sheets";
 import * as store from "@/lib/store";
-import { normalizeStatus, PRIORITIES, STATUSES, taskKey, type Decision, type Settings, type Triage } from "@/lib/tasks";
-import { fmtSheetDate, fmtSheetStamp, parseDayKey, parseSheetDate, weekKey } from "@/lib/time";
+import { firstLine, PRIORITIES, STATUSES, type Decision, type Settings, type Triage } from "@/lib/tasks";
+import { fmtSheetDate, mondayOf, parseDayKey, weekKey } from "@/lib/time";
+import { createTask, patchTask, runOp } from "@/lib/writes";
 
 export type Result<T = undefined> = { ok: true; value: T } | { ok: false; error: string };
 const ok = <T,>(value: T): Result<T> => ({ ok: true, value });
@@ -75,19 +78,9 @@ export async function updateTask(input: { row: number; no: string; status?: stri
     patch.due = ms == null ? "" : fmtSheetDate(ms);
   }
   try {
-    if (isDemo()) {
-      const t = demoState().tasks.find((x) => x.row === input.row && x.no === input.no);
-      if (!t) return fail("タスクが見つかりません。");
-      if (patch.status) t.status = normalizeStatus(patch.status);
-      if (patch.prio) t.prio = patch.prio;
-      if (patch.due !== undefined) {
-        t.due = parseSheetDate(patch.due);
-        t.dueText = "";
-      }
-    } else {
-      await updateTaskRow(input.row, input.no, patch);
-      revalidateTag(SHEET_TAG);
-    }
+    const t = (await loadBoard()).tasks.find((x) => x.row === input.row && x.no === input.no);
+    if (isDemo() && !t) return fail("タスクが見つかりません。");
+    await patchTask({ row: input.row, no: input.no, title: t?.title }, patch);
     return ok(undefined);
   } catch (e) {
     return fail(explain(e, "スプシへの書き込みに失敗しました。"));
@@ -99,27 +92,199 @@ export async function addTask(input: { title: string; prio?: string; due?: strin
   const title = input.title.trim().slice(0, 2000);
   if (!title) return fail("タスク名を入れてください。");
   const prio = input.prio && (PRIORITIES as readonly string[]).includes(input.prio) ? input.prio : "-";
-  const dueMs = input.due ? parseDayKey(input.due) : null;
-  const now = Date.now();
+  const due = input.due && parseDayKey(input.due) != null ? input.due : "";
   try {
-    if (isDemo()) {
-      const s = demoState();
-      const no = String(Math.max(0, ...s.tasks.map((t) => Number(t.no) || 0)) + 1);
-      s.tasks.unshift({ key: taskKey(no), no, row: s.tasks.length + 2, status: "未着手", title, prio, due: dueMs, dueText: "", posted: now, group: process.env.TASK_SOURCE_NAME || "タスクボード", note: "", url: "" });
-      return ok(no);
-    }
-    const no = await appendTask({
-      title,
-      prio,
-      due: dueMs == null ? "" : fmtSheetDate(dueMs),
-      posted: fmtSheetStamp(now),
-      owner: process.env.TASK_OWNER_NAME || "Kei Kubota",
-      group: process.env.TASK_SOURCE_NAME || "タスクボード",
-    });
-    revalidateTag(SHEET_TAG);
-    return ok(no);
+    return ok(await createTask({ title, prio, due }));
   } catch (e) {
     return fail(explain(e, "スプシへの追加に失敗しました。"));
+  }
+}
+
+/* ---------- 今日: focus ---------- */
+
+async function findTask(key: string) {
+  if (typeof key !== "string") return null;
+  return (await loadBoard()).tasks.find((t) => t.key === key) ?? null;
+}
+
+/** 始める: the sheet's 完了状態 becomes 進行中 and the task becomes the focus. */
+export async function startTask(key: string): Promise<Result<Focus>> {
+  await requireAuth();
+  const t = await findTask(key);
+  if (!t) return fail("タスクが見つかりません。再読み込みしてください。");
+  if (t.status === "完了" || t.status === "メモ") return fail("このタスクは始められません。");
+  try {
+    if (t.status !== "進行中") await patchTask(t, { status: "進行中" });
+    const focus = { taskKey: t.key, startedAt: Date.now() };
+    await store.setFocus(focus);
+    revalidatePath("/", "layout");
+    return ok(focus);
+  } catch (e) {
+    return fail(explain(e, "始められませんでした。"));
+  }
+}
+
+/** 終わった: 完了 in the sheet, focus cleared. Returns this week's done count for the celebration. */
+export async function finishTask(key: string): Promise<Result<{ weekDone: number }>> {
+  await requireAuth();
+  const t = await findTask(key);
+  if (!t) return fail("タスクが見つかりません。再読み込みしてください。");
+  try {
+    if (t.status !== "完了") await patchTask(t, { status: "完了" });
+    const focus = await store.getFocus();
+    if (focus?.taskKey === key) await store.setFocus(null);
+    const board = await loadBoard();
+    const now = Date.now();
+    const done = doneThisWeek(board.tasks, board.triage, await store.listDone(mondayOf(now)), now);
+    done.add(key);
+    revalidatePath("/", "layout");
+    return ok({ weekDone: done.size });
+  } catch (e) {
+    return fail(explain(e, "完了にできませんでした。"));
+  }
+}
+
+/** 後にする: only the focus is cleared; the sheet is not touched. */
+export async function postponeFocus(): Promise<Result> {
+  await requireAuth();
+  try {
+    await store.setFocus(null);
+    revalidatePath("/", "layout");
+    return ok(undefined);
+  } catch (e) {
+    return fail(explain(e, "保存できませんでした。"));
+  }
+}
+
+/** 相談したい: flag the task on the team page and ask リマ to draft the message. */
+export async function askConsult(key: string): Promise<Result> {
+  await requireAuth();
+  const t = await findTask(key);
+  if (!t) return fail("タスクが見つかりません。再読み込みしてください。");
+  const now = Date.now();
+  try {
+    await store.setConsult({ taskKey: t.key, title: firstLine(t.title, 120), createdAt: now });
+    await store.createRequest({
+      id: crypto.randomUUID(),
+      kind: "consult",
+      text: `「${firstLine(t.title, 120)}」（No.${t.no}）で詰まっています。チームに送る相談の文面を短く下書きしてください。`,
+      taskKey: t.key,
+      status: "pending",
+      reply: "",
+      actions: [],
+      createdAt: now,
+      updatedAt: now,
+    });
+    revalidatePath("/", "layout");
+    return ok(undefined);
+  } catch (e) {
+    return fail(explain(e, "相談の印を付けられませんでした。"));
+  }
+}
+
+export async function clearConsultFlag(key: string): Promise<Result> {
+  await requireAuth();
+  try {
+    await store.clearConsult(String(key));
+    revalidatePath("/", "layout");
+    return ok(undefined);
+  } catch (e) {
+    return fail(explain(e, "印を外せませんでした。"));
+  }
+}
+
+/* ---------- parking (思いついたことのメモ) ---------- */
+
+export async function addParking(text: string): Promise<Result<store.Parking>> {
+  await requireAuth();
+  const t = String(text ?? "").trim().slice(0, 500);
+  if (!t) return fail("メモが空です。");
+  const p = { id: crypto.randomUUID(), text: t, createdAt: Date.now() };
+  try {
+    await store.addParking(p);
+    revalidatePath("/", "layout");
+    return ok(p);
+  } catch (e) {
+    return fail(explain(e, "メモを保存できませんでした。"));
+  }
+}
+
+export async function discardParking(id: string): Promise<Result> {
+  await requireAuth();
+  try {
+    await store.removeParking(String(id));
+    revalidatePath("/", "layout");
+    return ok(undefined);
+  } catch (e) {
+    return fail(explain(e, "捨てられませんでした。"));
+  }
+}
+
+/** タスクにする: add to the sheet (existing add path), then drop the memo. */
+export async function parkingToTask(id: string): Promise<Result<string>> {
+  await requireAuth();
+  const p = (await store.listParking()).find((x) => x.id === id);
+  if (!p) return fail("メモが見つかりません。");
+  try {
+    const no = await createTask({ title: p.text.slice(0, 2000), prio: "-" });
+    await store.removeParking(id);
+    revalidatePath("/", "layout");
+    return ok(no);
+  } catch (e) {
+    return fail(explain(e, "タスクにできませんでした。"));
+  }
+}
+
+/* ---------- リマに話す (AI requests processed on the Mac) ---------- */
+
+export async function sendToRima(input: { text: string; kind?: RequestKind; taskKey?: string | null }): Promise<Result<AiRequest>> {
+  await requireAuth();
+  const text = String(input.text ?? "").trim().slice(0, MAX_REQUEST_TEXT);
+  if (!text) return fail("話す内容を入れてください。");
+  const kind: RequestKind = input.kind === "dev" ? "dev" : "chat";
+  const now = Date.now();
+  const r: AiRequest = { id: crypto.randomUUID(), kind, text, taskKey: input.taskKey ?? null, status: "pending", reply: "", actions: [], createdAt: now, updatedAt: now };
+  try {
+    await store.createRequest(r);
+    return ok(r);
+  } catch (e) {
+    return fail(explain(e, "リマに送れませんでした。"));
+  }
+}
+
+export async function fetchRequests(): Promise<Result<AiRequest[]>> {
+  await requireAuth();
+  try {
+    return ok(await store.listRequests(20));
+  } catch (e) {
+    return fail(explain(e, "リマとのやりとりを読めませんでした。"));
+  }
+}
+
+/**
+ * The user pressed an action button: that press is the approval. The op is
+ * validated again against the current sheet before it runs, and runs at most once.
+ */
+export async function runAction(input: { requestId: string; actionId: string }): Promise<Result<string>> {
+  await requireAuth();
+  const req = await store.getRequest(String(input.requestId));
+  const action = req?.actions.find((a) => a.id === input.actionId);
+  if (!req || !action) return fail("ボタンが見つかりません。");
+  if (action.done) return fail("このボタンはもう実行しました。");
+  revalidateTag(SHEET_TAG); // validate against a fresh read, not the 60s cache
+  const board = await loadBoard();
+  if (board.error) return fail(board.error);
+  const op = validateOp(action.op, board.tasks);
+  if (!op.ok) return fail(`実行できません: ${op.error}`);
+  if (!(await store.setActionDone(req.id, action.id, true))) return fail("このボタンはもう実行しました。");
+  try {
+    const msg = await runOp(op.value, board.tasks);
+    revalidateTag(SHEET_TAG);
+    revalidatePath("/", "layout");
+    return ok(msg);
+  } catch (e) {
+    await store.setActionDone(req.id, action.id, false).catch(() => {});
+    return fail(explain(e, "実行できませんでした。"));
   }
 }
 

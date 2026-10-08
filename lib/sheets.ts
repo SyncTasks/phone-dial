@@ -1,5 +1,5 @@
 import "server-only";
-import { importPKCS8, SignJWT } from "jose";
+import { GoogleAuthError, googleAccessToken, serviceAccountConfigured } from "./google";
 import { normalizeStatus, taskKey, type Task } from "./tasks";
 import { parseSheetDate } from "./time";
 
@@ -31,38 +31,19 @@ export class SheetError extends Error {
 }
 
 export function sheetConfigured() {
-  return Boolean(process.env.SHEET_ID && process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL && process.env.GOOGLE_PRIVATE_KEY);
+  return Boolean(process.env.SHEET_ID && serviceAccountConfigured());
 }
 
 const tab = () => process.env.SHEET_TAB || "久保田";
 const range = (a1: string) => encodeURIComponent(`'${tab().replace(/'/g, "''")}'!${a1}`);
 
-let cachedToken: { value: string; exp: number } | null = null;
-
 async function accessToken() {
-  if (cachedToken && cachedToken.exp - 60_000 > Date.now()) return cachedToken.value;
-  const email = process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL;
-  const raw = process.env.GOOGLE_PRIVATE_KEY;
-  if (!email || !raw) throw new SheetError("Googleのサービスアカウントが設定されていません。", "config");
-  const key = await importPKCS8(raw.replace(/\\n/g, "\n"), "RS256");
-  const now = Math.floor(Date.now() / 1000);
-  const assertion = await new SignJWT({ scope: SCOPE })
-    .setProtectedHeader({ alg: "RS256", typ: "JWT" })
-    .setIssuer(email)
-    .setAudience("https://oauth2.googleapis.com/token")
-    .setIssuedAt(now)
-    .setExpirationTime(now + 3600)
-    .sign(key);
-  const res = await fetch("https://oauth2.googleapis.com/token", {
-    method: "POST",
-    headers: { "content-type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({ grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer", assertion }),
-    cache: "no-store",
-  });
-  if (!res.ok) throw new SheetError(`Googleの認証に失敗しました（${res.status}）。サービスアカウントの鍵を確認してください。`, "auth");
-  const json = (await res.json()) as { access_token: string; expires_in: number };
-  cachedToken = { value: json.access_token, exp: Date.now() + json.expires_in * 1000 };
-  return cachedToken.value;
+  try {
+    return await googleAccessToken(SCOPE);
+  } catch (e) {
+    if (e instanceof GoogleAuthError) throw new SheetError(e.message, e.kind);
+    throw e;
+  }
 }
 
 async function call<T>(path: string, init?: RequestInit): Promise<T> {
@@ -141,7 +122,9 @@ export type TaskPatch = Partial<{ status: string; prio: string; due: string }>;
  * Write fields of one task back to its row. The row is re-read first and must
  * still hold the same No, so a sheet edited in the meantime is never clobbered.
  */
-export async function updateTaskRow(row: number, no: string, patch: TaskPatch) {
+/** Re-read the header and one row; throw unless that row still holds `no`. */
+async function verifiedRow(row: number, no: string) {
+  if (!Number.isInteger(row) || row < 2) throw new SheetError("行番号が不正です。", "conflict");
   const head = await call<{ values?: string[][] }>(`/values/${range("1:1")}`);
   const col = headerMap(head.values?.[0] ?? []);
   const current = await call<{ values?: string[][] }>(`/values/${range(`${row}:${row}`)}`);
@@ -149,6 +132,11 @@ export async function updateTaskRow(row: number, no: string, patch: TaskPatch) {
   if (col.no < 0 || String(cells[col.no] ?? "").trim() !== no) {
     throw new SheetError("スプシの行がずれています。再読み込みしてからもう一度お試しください。", "conflict");
   }
+  return { col, cells };
+}
+
+export async function updateTaskRow(row: number, no: string, patch: TaskPatch) {
+  const { col } = await verifiedRow(row, no);
   const data = (Object.keys(patch) as (keyof TaskPatch)[])
     .filter((f) => patch[f] !== undefined && col[f] >= 0)
     .map((f) => ({ range: `'${tab()}'!${colLetter(col[f])}${row}`, values: [[patch[f]]] }));
@@ -160,7 +148,7 @@ export async function updateTaskRow(row: number, no: string, patch: TaskPatch) {
 }
 
 /** Append a new task as the next No. Returns the new No. */
-export async function appendTask(fields: { title: string; prio: string; due: string; posted: string; owner: string; group: string }) {
+export async function appendTask(fields: { title: string; prio: string; due: string; posted: string; owner: string; group: string; note?: string }) {
   const values = (await call<{ values?: string[][] }>(`/values/${range("A1:Z")}`)).values ?? [];
   const header = values[0] ?? [];
   const col = headerMap(header);
@@ -179,9 +167,36 @@ export async function appendTask(fields: { title: string; prio: string; due: str
   set("posted", fields.posted);
   set("owner", fields.owner);
   set("group", fields.group);
+  if (fields.note) set("note", fields.note);
   await call(`/values/${range("A1")}:append?valueInputOption=USER_ENTERED&insertDataOption=INSERT_ROWS`, {
     method: "POST",
     body: JSON.stringify({ values: [row] }),
   });
   return no;
+}
+
+/** The marker the autonomous-dev patrol (kubota_tasks.py list --ai) looks for in タスク名 / 備考. */
+export const AI_MARK = /[#＃]\s?AI(?![A-Za-z])/i;
+
+/** 備考 with " #AI" appended, or null when the marker is already there. */
+export function withDevMarker(note: string) {
+  if (AI_MARK.test(note)) return null;
+  return note.trim() ? `${note.trimEnd()} #AI` : "#AI";
+}
+
+/**
+ * Hand a task to the autonomous-dev patrol: append " #AI" to its 備考.
+ * Same No verification as other writes, and only the 備考 cell is written.
+ * Returns false when the marker was already there.
+ */
+export async function appendDevMarker(row: number, no: string) {
+  const { col, cells } = await verifiedRow(row, no);
+  if (col.note < 0) throw new SheetError("シートに「備考」列が見つかりません。", "config");
+  const next = withDevMarker(String(cells[col.note] ?? ""));
+  if (next == null) return false;
+  await call(`/values:batchUpdate`, {
+    method: "POST",
+    body: JSON.stringify({ valueInputOption: "RAW", data: [{ range: `'${tab()}'!${colLetter(col.note)}${row}`, values: [[next]] }] }),
+  });
+  return true;
 }
