@@ -1,5 +1,6 @@
 "use client";
 
+import { RefreshCw } from "lucide-react";
 import { useRouter } from "next/navigation";
 import { useTransition } from "react";
 import { refreshSheet } from "@/app/actions";
@@ -9,9 +10,11 @@ export function SyncButton() {
   const [pending, start] = useTransition();
   return (
     <button
-      className="btn sm"
+      className="icon-btn"
       type="button"
       disabled={pending}
+      aria-label="スプシを読み込み直す"
+      title="スプシを読み込み直す"
       onClick={() =>
         start(async () => {
           await refreshSheet();
@@ -19,7 +22,7 @@ export function SyncButton() {
         })
       }
     >
-      {pending ? "読み込み中…" : "再読み込み"}
+      <RefreshCw size={17} aria-hidden="true" className={pending ? "spin" : undefined} />
     </button>
   );
 }

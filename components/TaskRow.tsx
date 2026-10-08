@@ -1,5 +1,6 @@
 "use client";
 
+import { ExternalLink } from "lucide-react";
 import { useState } from "react";
 import { DECISION_LABEL, PRIORITIES, STATUSES, type Decision, type Status, type Task } from "@/lib/tasks";
 import { dayKey, daysFrom, fmtDate } from "@/lib/time";
@@ -32,7 +33,6 @@ export function TaskRow({
 }) {
   const [open, setOpen] = useState(false);
   const days = t.due != null ? daysFrom(t.due, now) : null;
-  const dueLate = days != null && isActive(t) && days <= 0;
   const bodyId = `task-${t.key}`;
 
   return (
@@ -45,9 +45,9 @@ export function TaskRow({
           {t.prio === "高" && <span className="chip hi">優先度 高</span>}
           {t.prio === "中" && <span className="chip mid">優先度 中</span>}
           {t.due != null ? (
-            <span style={dueLate ? { color: "var(--late)" } : undefined}>
+            <span>
               期日 {fmtDate(t.due)}
-              {days! < 0 && isActive(t) ? `・${-days!}日超過` : days === 0 ? "・今日" : ""}
+              {days! < 0 && isActive(t) ? `・${-days!}日繰り越し` : days === 0 ? "・今日" : ""}
             </span>
           ) : t.dueText ? (
             <span>期日 {t.dueText}</span>
@@ -109,7 +109,7 @@ export function TaskRow({
           <div className="t-extra">
             {t.note && <div>備考: {t.note}</div>}
             {/^https?:\/\//.test(t.url) ? (
-              <a href={t.url} target="_blank" rel="noopener noreferrer">参照URL ↗</a>
+              <a className="ext" href={t.url} target="_blank" rel="noopener noreferrer">参照URL<ExternalLink size={13} aria-hidden="true" /></a>
             ) : t.url ? (
               <div>参照: {t.url}</div>
             ) : null}

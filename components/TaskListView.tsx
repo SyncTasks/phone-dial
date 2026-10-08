@@ -2,7 +2,8 @@
 
 import { useRouter, useSearchParams } from "next/navigation";
 import { useMemo, useState } from "react";
-import { decisionOf, newestFirst, STATUSES, type Task, type Triage } from "@/lib/tasks";
+import { decisionOf, newestFirst, openByGroup, STATUSES, weeklyFlow, type Task, type Triage } from "@/lib/tasks";
+import { GroupBars, WeeklyBars } from "./Charts";
 import { AddTask } from "./AddTask";
 import { TaskRow } from "./TaskRow";
 import { ToastView, useTasks, useToast } from "./useBoard";
@@ -77,6 +78,25 @@ export function TaskListView({ initialTasks, triage, now }: { initialTasks: Task
           </button>
         )}
       </section>
+      {tasks.length > 0 && (
+        <details className="panel trends">
+          <summary>傾向を見る（週ごとの流入と消化・発生元）</summary>
+          <div className="grid2">
+            <div>
+              <h3>週ごとの流入と消化</h3>
+              <WeeklyBars rows={weeklyFlow(tasks, now).rows} />
+              <div className="legend">
+                <span><i className="dot" style={{ background: "var(--done)" }} />完了済み</span>
+                <span><i className="dot" style={{ background: "var(--todo)" }} />残っている</span>
+              </div>
+            </div>
+            <div>
+              <h3>残タスクの発生元（未着手＋進行中）</h3>
+              <GroupBars rows={openByGroup(tasks)} />
+            </div>
+          </div>
+        </details>
+      )}
       <ToastView toast={toast} />
     </>
   );

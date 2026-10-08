@@ -1,141 +1,219 @@
 "use client";
 
+import { Check, CircleCheck, HandHelping, ListTodo, Pause, Play, X } from "lucide-react";
 import Link from "next/link";
-import { decisionOf, newestFirst, openByGroup, summarize, weeklyFlow, type Settings, type Task, type Triage } from "@/lib/tasks";
-import { fmtDate, fmtTime, lastSlot, nextSlot } from "@/lib/time";
-import { AddTask } from "./AddTask";
-import { CompletionRing, GroupBars, WeeklyBars } from "./Charts";
-import { TaskRow } from "./TaskRow";
-import { ToastView, useTasks, useToast } from "./useBoard";
+import { useRouter } from "next/navigation";
+import { useEffect, useState, useTransition } from "react";
+import { askConsult, clearConsultFlag, finishTask, postponeFocus, startTask } from "@/app/actions";
+import { nextUp, pickFocus, todayNumbers, type DoneEntry, type Focus, type FocusPick } from "@/lib/focus";
+import type { CalEvent } from "@/lib/schedule";
+import type { Settings, Task, Triage } from "@/lib/tasks";
+import { daysFrom, fmtDate, lastSlot } from "@/lib/time";
+import { ParkingCapture } from "./ParkingCapture";
+import { ScheduleStrip } from "./ScheduleStrip";
+import { fmtSpan, ToastView, useNow, useToast } from "./useBoard";
 
-const PER_GROUP = 8;
+const REASON: Record<FocusPick["reason"], string> = {
+  started: "始めたタスク",
+  week: "今週やるの一番上",
+  priority: "優先度が高い順",
+};
 
 export function TodayView({
-  initialTasks,
+  tasks,
   triage,
   settings,
-  now,
+  now: serverNow,
+  focus,
+  consultKeys,
+  doneLog,
+  parkingCount,
+  schedule,
   queueCount,
 }: {
-  initialTasks: Task[];
+  tasks: Task[];
   triage: Record<string, Triage>;
   settings: Settings;
   now: number;
+  focus: Focus | null;
+  consultKeys: string[];
+  doneLog: DoneEntry[];
+  parkingCount: number;
+  schedule: CalEvent[] | null;
   queueCount: number;
 }) {
+  const router = useRouter();
   const { toast, show } = useToast();
-  const { tasks, patch, pending } = useTasks(initialTasks, show);
-  const loaded = tasks.length > 0;
-  const s = summarize(tasks, triage, now);
-  const dec = (t: Task) => decisionOf(t, triage, now);
+  const now = useNow(serverNow);
+  const [refreshing, start] = useTransition();
+  const [finishing, setFinishing] = useState(false);
+  const busy = refreshing || finishing;
+  const [celebrate, setCelebrate] = useState<{ title: string; weekDone: number } | null>(null);
 
-  const doing = tasks.filter((t) => t.status === "進行中" && dec(t) !== "do" && dec(t) !== "skip").sort(newestFirst);
-  const groups: [string, Task[], string][] = [
-    ["今週やる", [...s.weekDo].sort((a, b) => (triage[a.key]?.decidedAt ?? 0) - (triage[b.key]?.decidedAt ?? 0)), "var(--accent)"],
-    ["期限切れ", [...s.late].sort((a, b) => a.due! - b.due!), "var(--late)"],
-    ["3日以内に期日", [...s.dueSoon].sort((a, b) => a.due! - b.due!), "var(--doing)"],
-    ["進行中", doing, "var(--doing)"],
-    ["今日・昨日の新着", [...s.fresh].sort(newestFirst), "var(--todo)"],
-  ];
-  const shown = new Set<string>();
-  const visible = groups
-    .map(([name, list, c]) => {
-      const uniq = list.filter((t) => !shown.has(t.key));
-      uniq.forEach((t) => shown.add(t.key));
-      return [name, uniq, c] as [string, Task[], string];
-    })
-    .filter(([, l]) => l.length);
+  const pick = pickFocus(tasks, triage, focus, serverNow);
+  const next = nextUp(tasks, triage, pick?.task.key ?? null, serverNow, 2);
+  const nums = todayNumbers(tasks, triage, doneLog, serverNow);
+  const consults = new Set(consultKeys);
+  const reviewDue = !settings.lastReviewAt || settings.lastReviewAt < lastSlot(serverNow, settings.reviewDow, settings.reviewTime);
 
-  const due = !settings.lastReviewAt || settings.lastReviewAt < lastSlot(now, settings.reviewDow, settings.reviewTime);
-  const nx = nextSlot(now, settings.reviewDow, settings.reviewTime);
-  const counts: [string, number, string, string][] = [
-    ["今週やる", s.weekDo.length, "var(--accent)", "/review"],
-    ["進行中", s.by["進行中"], "var(--doing)", "/tasks?status=進行中"],
-    ["未着手", s.by["未着手"], "var(--todo)", "/tasks?status=未着手"],
-    ["保留", s.by["保留"], "var(--hold)", "/tasks?status=保留"],
-    ["今日・昨日の新着", s.fresh.length, "var(--accent)", "#focus"],
-    ["期限切れ", s.late.length, "var(--late)", "#focus"],
-  ];
+  useEffect(() => {
+    if (!celebrate) return;
+    const id = setTimeout(() => setCelebrate(null), 4000);
+    return () => clearTimeout(id);
+  }, [celebrate]);
+
+  const act = (fn: () => Promise<{ ok: true; value: unknown } | { ok: false; error: string }>, okText?: string) =>
+    start(async () => {
+      const res = await fn();
+      if (!res.ok) return show(res.error, true);
+      if (okText) show(okText);
+      router.refresh();
+    });
+
+  const begin = (t: Task) => act(() => startTask(t.key), "始めました。チームのページにも「進行中」で出ます");
+  // Celebrate as soon as the sheet says 完了, without waiting for the page refresh.
+  const finish = async (t: Task) => {
+    setFinishing(true);
+    const res = await finishTask(t.key);
+    setFinishing(false);
+    if (!res.ok) return show(res.error, true);
+    setCelebrate({ title: t.title, weekDone: res.value.weekDone });
+    start(() => router.refresh());
+  };
 
   return (
     <>
-      <div className={`callout${due ? " due" : ""}`}>
-        <div>
-          <b>{due ? "週次整理の時間です" : "週次整理"}</b>
-          <div className="note">
-            {due ? `未判断 ${queueCount}件。` : `次は ${fmtDate(nx)} ${fmtTime(nx)}。`}
-            {settings.lastReviewAt ? ` 前回 ${fmtDate(settings.lastReviewAt)}` : " まだ一度も整理していません"}
-          </div>
-        </div>
-        <Link className="btn primary" href="/review">整理を始める</Link>
-      </div>
+      {schedule && <ScheduleStrip events={schedule} initialNow={serverNow} />}
 
-      <section className="panel" aria-label="サマリー">
-        <div className="kpis">
-          <CompletionRing rate={s.rate} empty={!loaded} />
-          <div className="counts">
-            {counts.map(([label, n, c, href]) => (
-              <Link className="count" key={label} href={href}>
-                <span className="lab"><i className="dot" style={{ background: c }} />{label}</span>
-                <span className="val">{loaded ? n : "–"}</span>
-              </Link>
-            ))}
-          </div>
-        </div>
-      </section>
+      <p className="nums" aria-label="今の状況">
+        <Link href="/tasks?status=進行中"><span>進行中</span> <b>{nums.doing}</b></Link>
+        <Link href="/review"><span>今週やる</span> <b>{nums.weekDo}</b></Link>
+        <span><span>今週完了</span> <b>{nums.weekDone}</b></span>
+        <span><span>繰り越し</span> <b>{nums.carried}</b></span>
+      </p>
 
-      <section className="panel" aria-label="タスクを追加">
-        <AddTask notify={show} />
-      </section>
-
-      <div className="grid2">
-        <section className="panel" id="focus" aria-labelledby="h-today">
-          <div className="panel-head">
-            <h2 id="h-today">今日見るもの</h2>
-            <span className="sub">今週やる・期限・進行中・新着</span>
-          </div>
-          {!visible.length ? (
-            <p className="empty">急ぎのタスクはありません。週次整理で「今週やる」を決めるとここに出ます。</p>
-          ) : (
-            visible.map(([name, list, c]) => (
-              <div className="focus-group" key={name}>
-                <div className="fg-title">
-                  <i className="dot" style={{ background: c }} />
-                  <span>{name}</span>
-                  <span className="n">{list.length}件</span>
-                </div>
-                <ul className="tasks">
-                  {list.slice(0, PER_GROUP).map((t) => (
-                    <TaskRow key={t.key} task={t} now={now} decision={dec(t)} pending={pending.has(t.key)} onPatch={patch} />
-                  ))}
-                </ul>
-                {list.length > PER_GROUP && <p className="empty">ほか{list.length - PER_GROUP}件は<Link href="/tasks">一覧</Link>から</p>}
-              </div>
-            ))
+      <div className="today-grid">
+      <section className={`now-card${busy ? " is-busy" : ""}`} aria-labelledby="h-now">
+        <div className="now-top">
+          <h2 id="h-now">今やること</h2>
+          {pick && (
+            <span className="now-why">
+              {pick.reason === "started" && pick.startedAt ? `始めて${fmtSpan(now - pick.startedAt)}` : REASON[pick.reason]}
+            </span>
           )}
-        </section>
-        <div className="col">
-          <section className="panel" aria-labelledby="h-week">
-            <div className="panel-head">
-              <h2 id="h-week">週ごとの流入と消化</h2>
-              <span className="sub">投稿日ベース・直近10週</span>
-            </div>
-            {loaded ? <WeeklyBars rows={weeklyFlow(tasks, now).rows} /> : <div className="skeleton" />}
-            <div className="legend">
-              <span><i className="dot" style={{ background: "var(--done)" }} />完了済み</span>
-              <span><i className="dot" style={{ background: "var(--todo)" }} />残っている</span>
-            </div>
-          </section>
-          <section className="panel" aria-labelledby="h-group">
-            <div className="panel-head">
-              <h2 id="h-group">残タスクの発生元</h2>
-              <span className="sub">未着手＋進行中</span>
-            </div>
-            <GroupBars rows={openByGroup(tasks)} />
-          </section>
         </div>
+        {!pick ? (
+          <div className="now-empty">
+            <p>今やることはありません。</p>
+            <p className="note">週次整理で「今週やる」を決めるか、一覧から選んで始めましょう。</p>
+          </div>
+        ) : (
+          <>
+            <p className="now-title">{pick.task.title}</p>
+            <TaskMeta t={pick.task} now={serverNow} />
+            {consults.has(pick.task.key) && (
+              <p className="now-flag">
+                <HandHelping size={14} aria-hidden="true" />
+                <span>相談の印あり（チームのページに表示中）</span>
+                <button type="button" className="btn sm ghost" disabled={busy} onClick={() => act(() => clearConsultFlag(pick.task.key), "相談の印を外しました")}>
+                  外す
+                </button>
+              </p>
+            )}
+            <div className="now-actions">
+              {pick.reason === "started" ? (
+                <button type="button" className="big primary" disabled={busy} onClick={() => finish(pick.task)}>
+                  <Check size={20} aria-hidden="true" />終わった
+                </button>
+              ) : (
+                <button type="button" className="big primary" disabled={busy} onClick={() => begin(pick.task)}>
+                  <Play size={20} aria-hidden="true" />始める
+                </button>
+              )}
+              <div className="now-sub">
+                {pick.reason === "started" ? (
+                  <button type="button" className="btn" disabled={busy} onClick={() => act(postponeFocus, "後にしました。また選び直せます")}>
+                    <Pause size={16} aria-hidden="true" />後にする
+                  </button>
+                ) : (
+                  <button type="button" className="btn" disabled={busy} onClick={() => finish(pick.task)}>
+                    <Check size={16} aria-hidden="true" />終わった
+                  </button>
+                )}
+                {!consults.has(pick.task.key) && (
+                  <button
+                    type="button"
+                    className="btn"
+                    disabled={busy}
+                    onClick={() => act(() => askConsult(pick.task.key), "相談の印を付けました。リマが文面を下書きします")}
+                  >
+                    <HandHelping size={16} aria-hidden="true" />相談したい
+                  </button>
+                )}
+              </div>
+            </div>
+          </>
+        )}
+        <ParkingCapture count={parkingCount} notify={show} />
+      </section>
+
+      <div className="today-side">
+      {next.length > 0 && (
+        <section className="next" aria-labelledby="h-next">
+          <h2 id="h-next">次の2つ</h2>
+          <ul>
+            {next.map((t) => (
+              <li key={t.key}>
+                <div className="next-body">
+                  <p className="next-title">{t.title}</p>
+                  <TaskMeta t={t} now={serverNow} />
+                </div>
+                <button type="button" className="btn sm" disabled={busy} onClick={() => begin(t)} aria-label={`「${t.title.slice(0, 30)}」を先に始める`}>
+                  <Play size={14} aria-hidden="true" />先にやる
+                </button>
+              </li>
+            ))}
+          </ul>
+        </section>
+      )}
+
+      <p className="today-links">
+        <Link className="btn ghost" href="/tasks"><ListTodo size={16} aria-hidden="true" />一覧ですべて見る</Link>
+        {reviewDue && (
+          <Link className="btn" href="/review">週次整理の時間です{queueCount ? `（未判断 ${queueCount}件）` : ""}</Link>
+        )}
+      </p>
       </div>
+      </div>
+
+      {celebrate && (
+        <div className="celebrate" role="status" onClick={() => setCelebrate(null)}>
+          <div className="celebrate-card">
+            <CircleCheck size={44} aria-hidden="true" className="celebrate-icon" />
+            <p className="celebrate-big">おつかれさま！</p>
+            <p>今週 <b className="mono">{celebrate.weekDone}</b> 件目の完了です</p>
+            <p className="note celebrate-title">{celebrate.title.split("\n")[0].slice(0, 60)}</p>
+            <button type="button" className="btn sm ghost"><X size={14} aria-hidden="true" />閉じる</button>
+          </div>
+        </div>
+      )}
       <ToastView toast={toast} />
     </>
+  );
+}
+
+function TaskMeta({ t, now }: { t: Task; now: number }) {
+  const days = t.due != null ? daysFrom(t.due, now) : null;
+  return (
+    <p className="t-meta">
+      <span className="mono">No.{t.no}</span>
+      <span>{t.status}</span>
+      {(t.prio === "高" || t.prio === "中") && <span className={`chip ${t.prio === "高" ? "hi" : "mid"}`}>優先度 {t.prio}</span>}
+      {t.due != null ? (
+        <span>{days! < 0 ? `${-days!}日繰り越し` : days === 0 ? "期日 今日" : `期日 ${fmtDate(t.due)}`}</span>
+      ) : t.dueText ? (
+        <span>期日 {t.dueText}</span>
+      ) : null}
+    </p>
   );
 }

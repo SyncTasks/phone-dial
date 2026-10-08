@@ -72,3 +72,23 @@ export function ToastView({ toast }: { toast: Toast }) {
     </div>
   );
 }
+
+/** Current time, re-rendered every `every` ms (starts from the server's `initial` to avoid a hydration mismatch). */
+export function useNow(initial: number, every = 30000) {
+  const [now, setNow] = useState(initial);
+  useEffect(() => {
+    setNow(Date.now());
+    const id = setInterval(() => setNow(Date.now()), every);
+    return () => clearInterval(id);
+  }, [every]);
+  return now;
+}
+
+/** "25分" / "1時間5分" */
+export function fmtSpan(ms: number) {
+  const min = Math.max(0, Math.round(ms / 60000));
+  if (min < 60) return `${min}分`;
+  const h = Math.floor(min / 60);
+  const m = min % 60;
+  return m ? `${h}時間${m}分` : `${h}時間`;
+}

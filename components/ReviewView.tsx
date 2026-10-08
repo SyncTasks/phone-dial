@@ -4,6 +4,8 @@ import { useCallback, useEffect, useState, useTransition } from "react";
 import { decide, restoreDecision, saveReviewSettings } from "@/app/actions";
 import { decisionOf, DECISION_LABEL, firstLine, isOpen, newestFirst, reviewQueue, type Decision, type Settings, type Task, type Triage } from "@/lib/tasks";
 import { addDays, fmtDate, fmtTime, mondayOf, nextSlot, weekKey, WEEKDAYS } from "@/lib/time";
+import type { Parking } from "@/lib/store";
+import { ParkingSort } from "./ParkingSort";
 import { STATUS_COLOR, TaskRow } from "./TaskRow";
 import { ToastView, useTasks, useToast, useTriage } from "./useBoard";
 
@@ -13,11 +15,13 @@ export function ReviewView({
   initialTasks,
   initialTriage,
   initialSettings,
+  initialParking,
   now,
 }: {
   initialTasks: Task[];
   initialTriage: Record<string, Triage>;
   initialSettings: Settings;
+  initialParking: Parking[];
   now: number;
 }) {
   const { toast, show } = useToast();
@@ -145,15 +149,17 @@ export function ReviewView({
           <div className="progress" aria-hidden="true">
             <i style={{ width: `${(c.do / total) * 100}%`, background: "var(--accent)" }} />
             <i style={{ width: `${(c.later / total) * 100}%`, background: "var(--hold)" }} />
-            <i style={{ width: `${(c.skip / total) * 100}%`, background: "var(--late)" }} />
+            <i style={{ width: `${(c.skip / total) * 100}%`, background: "var(--memo)" }} />
           </div>
           <div className="tri-stats">
-            {([["今週やる", c.do, "var(--accent)"], ["来週考える", c.later, "var(--hold)"], ["やらない", c.skip, "var(--late)"], ["未判断", queue.length, "var(--line)"]] as const).map(([l, n, col]) => (
+            {([["今週やる", c.do, "var(--accent)"], ["来週考える", c.later, "var(--hold)"], ["やらない", c.skip, "var(--memo)"], ["未判断", queue.length, "var(--line)"]] as const).map(([l, n, col]) => (
               <span key={l}><i className="dot" style={{ background: col }} />{l} <b>{n}</b></span>
             ))}
           </div>
         </div>
       </section>
+
+      <ParkingSort initial={initialParking} notify={show} />
 
       {!tasks.length ? (
         <div className="panel empty">スプシを読み込むと整理を始められます。</div>
