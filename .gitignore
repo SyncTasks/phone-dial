@@ -5,3 +5,4 @@ out
 .env
 *.tsbuildinfo
 .vercel
+worker/.env
